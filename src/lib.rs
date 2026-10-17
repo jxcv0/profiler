@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "egui")]
 mod egui_ui;
 #[cfg(feature = "egui")]
-pub use egui_ui::{scope_color, show_scopes, show_timeline};
+pub use egui_ui::{ProfilerUi, ShareOf, scope_color, show_scopes, show_timeline};
 
 #[cfg(feature = "server")]
 mod server;

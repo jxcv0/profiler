@@ -2,7 +2,7 @@
 //!
 //! Run with `cargo run --example egui_tree --features egui`.
 
-use profiler::{Profiler, profile_scope, show_scopes, show_timeline};
+use profiler::{Profiler, ProfilerUi, profile_scope};
 
 fn simulate(profiler: &Profiler, values: &mut [u64]) {
     profile_scope!(profiler, "simulate");
@@ -24,6 +24,7 @@ fn sort(profiler: &Profiler, values: &[u64]) -> Vec<u64> {
 fn main() -> eframe::Result {
     let profiler = Profiler::new();
     let mut values: Vec<u64> = (0..100_000).collect();
+    let mut view = ProfilerUi::default();
 
     eframe::run_ui_native(
         "Profiler",
@@ -37,11 +38,7 @@ fn main() -> eframe::Result {
             egui::CentralPanel::default().show(ui, |ui| {
                 let window = profiler.window().as_secs();
                 ui.heading(format!("Scope timings, last {window} s"));
-                ui.label("Self time per 100 ms; a full column is a fully busy 100 ms.");
-                show_timeline(ui, &profiler.recent_series());
-                ui.separator();
-                ui.label("Bars: orange is time in the scope itself, blue is time in its children.");
-                show_scopes(ui, &profiler.recent_snapshot());
+                view.show(ui, &profiler);
             });
             ui.ctx().request_repaint();
         },

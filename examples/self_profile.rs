@@ -82,11 +82,12 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(feature = "egui")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use profiler::{show_scopes, show_timeline};
+    use profiler::ProfilerUi;
 
     let meta = Profiler::new();
     let target = Profiler::new();
     let mut server = ProfileServer::bind("127.0.0.1:5600")?;
+    let mut view = ProfilerUi::default();
 
     eframe::run_ui_native(
         "Profiler self-profile",
@@ -98,9 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             egui::CentralPanel::default().show(ui, |ui| {
                 let window = meta.window().as_secs();
                 ui.heading(format!("Profiler batch timings, last {window} s"));
-                show_timeline(ui, &meta.recent_series());
-                ui.separator();
-                show_scopes(ui, &meta.recent_snapshot());
+                view.show(ui, &meta);
             });
             ui.ctx().request_repaint();
         },
