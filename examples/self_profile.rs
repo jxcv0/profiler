@@ -34,6 +34,17 @@ fn frame(meta: &Profiler, target: &Profiler) {
                 profile_scope!(target, "flat");
             }
         });
+        // One repeated name that sorts before every other path, and one that sorts after.
+        profile_scope!(meta, "sorts first", {
+            for _ in 0..SCOPES {
+                profile_scope!(target, "a");
+            }
+        });
+        profile_scope!(meta, "sorts last", {
+            for _ in 0..SCOPES {
+                profile_scope!(target, "zz");
+            }
+        });
         profile_scope!(meta, "nested depth 8", {
             for _ in 0..SCOPES / DEPTH {
                 nest(target, DEPTH);
