@@ -3,6 +3,11 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "egui")]
+mod egui_ui;
+#[cfg(feature = "egui")]
+pub use egui_ui::show_scopes;
+
 /// Profile a supplied block and return its value.
 /// The profiler is borrowed, and repeated names under the same parent share results.
 /// The block keeps normal `return`, `?`, `break`, and `continue` behavior.
@@ -170,6 +175,56 @@ impl Profiler {
             ));
         }
         report
+    }
+
+    /// Return completed scopes as a tree, for a UI such as egui to draw each frame.
+    /// Siblings are sorted by name, and each total includes child time.
+    /// A parent that is still active appears with zero hits so its children have a place.
+    pub fn snapshot(&self) -> Vec<ScopeReport> {
+        let mut roots = Vec::new();
+        // Sorted paths visit each parent before its children, and siblings in name order.
+        for (path, stats) in self.scopes.borrow().iter() {
+            let (name, parents) = path.split_last().unwrap();
+            let mut siblings = &mut roots;
+            for &parent in parents {
+                siblings = ScopeReport::children_named(siblings, parent);
+            }
+            siblings.push(ScopeReport {
+                name,
+                hits: stats.hits,
+                total: Duration::from_secs_f64(stats.ticks as f64 / self.tsc_freq),
+                children: Vec::new(),
+            });
+        }
+        roots
+    }
+}
+
+/// One node of [`Profiler::snapshot`]: a scope path's totals and its child scopes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScopeReport {
+    pub name: &'static str,
+    pub hits: u64,
+    /// Total time across all hits, including children.
+    pub total: Duration,
+    pub children: Vec<ScopeReport>,
+}
+
+impl ScopeReport {
+    /// Find the children of the last sibling called `name`, adding an unfinished one if absent.
+    fn children_named<'a>(
+        siblings: &'a mut Vec<ScopeReport>,
+        name: &'static str,
+    ) -> &'a mut Vec<ScopeReport> {
+        if siblings.last().is_none_or(|last| last.name != name) {
+            siblings.push(ScopeReport {
+                name,
+                hits: 0,
+                total: Duration::ZERO,
+                children: Vec::new(),
+            });
+        }
+        &mut siblings.last_mut().unwrap().children
     }
 }
 
@@ -351,6 +406,77 @@ mod tests {
                 "    physics: 2 hits, 10.000 ms total\n",
             )
         );
+    }
+
+    fn report(
+        name: &'static str,
+        hits: u64,
+        milliseconds: u64,
+        children: Vec<ScopeReport>,
+    ) -> ScopeReport {
+        ScopeReport {
+            name,
+            hits,
+            total: Duration::from_millis(milliseconds),
+            children,
+        }
+    }
+
+    #[test]
+    fn snapshot_nests_children_sorted_by_name() {
+        let profiler = Profiler {
+            tsc_freq: 1000.0,
+            scopes: RefCell::new(BTreeMap::from([
+                (vec!["frame", "update"], ScopeStats { hits: 2, ticks: 30 }),
+                (
+                    vec!["frame"],
+                    ScopeStats {
+                        hits: 2,
+                        ticks: 100,
+                    },
+                ),
+                (
+                    vec!["frame", "update", "physics"],
+                    ScopeStats { hits: 2, ticks: 10 },
+                ),
+                (vec!["frame", "render"], ScopeStats { hits: 2, ticks: 20 }),
+                (vec!["load"], ScopeStats { hits: 1, ticks: 5 }),
+            ])),
+            active_scopes: RefCell::new(Vec::new()),
+        };
+
+        assert_eq!(
+            profiler.snapshot(),
+            vec![
+                report(
+                    "frame",
+                    2,
+                    100,
+                    vec![
+                        report("render", 2, 20, vec![]),
+                        report("update", 2, 30, vec![report("physics", 2, 10, vec![])]),
+                    ],
+                ),
+                report("load", 1, 5, vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_shows_an_unfinished_parent_with_zero_hits() {
+        let profiler = Profiler::new();
+        profile_scope!(profiler, "frame", {
+            profile_scope!(profiler, "update", {});
+            let snapshot = profiler.snapshot();
+
+            assert_eq!(snapshot.len(), 1);
+            assert_eq!(snapshot[0].name, "frame");
+            assert_eq!(snapshot[0].hits, 0);
+            assert_eq!(snapshot[0].total, Duration::ZERO);
+            assert_eq!(snapshot[0].children.len(), 1);
+            assert_eq!(snapshot[0].children[0].name, "update");
+            assert_eq!(snapshot[0].children[0].hits, 1);
+        });
     }
 
     #[test]
