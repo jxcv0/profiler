@@ -9,3 +9,10 @@ egui = { version = "0.37.0", default-features = false, features = ["default_font
 
 [features]
 egui = ["dep:egui"]
+
+[dev-dependencies]
+eframe = "0.37"
+
+[[example]]
+name = "egui_tree"
+required-features = ["egui"]
