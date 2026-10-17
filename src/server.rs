@@ -269,8 +269,8 @@ mod tests {
     #[test]
     fn snapshot_replies_with_the_scope_tree_as_json() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["frame", "sort"], 1_000, 3, 3);
-        profiler.record(vec!["frame"], 1_000, 5, 2);
+        profiler.record_path(&["frame", "sort"], 1_000, 3, 3);
+        profiler.record_path(&["frame"], 1_000, 5, 2);
         let mut server = ProfileServer::bind("127.0.0.1:0").unwrap();
 
         assert_eq!(
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn names_are_escaped_as_json_strings() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["say \"hi\"\\"], 1_000, 1, 1);
+        profiler.record_path(&["say \"hi\"\\"], 1_000, 1, 1);
         let mut server = ProfileServer::bind("127.0.0.1:0").unwrap();
 
         let reply = ask(&mut server, &profiler, "snapshot");

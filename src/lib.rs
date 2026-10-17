@@ -1,6 +1,6 @@
 use std::arch::x86_64::_rdtsc;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "egui")]
@@ -72,18 +72,57 @@ pub fn estimate_tsc_frequency() -> f64 {
 pub struct Profiler {
     tsc_freq: f64,
     window: Duration,
-    scopes: RefCell<BTreeMap<Vec<&'static str>, ScopeStats>>,
-    recent: RefCell<BTreeMap<Vec<&'static str>, VecDeque<TimeBucket>>>,
+    paths: RefCell<Paths>,
     active_scopes: RefCell<Vec<ActiveScope>>,
+}
+
+/// Every scope path started so far, under a dense id that indexes `entries`.
+#[derive(Default)]
+struct Paths {
+    ids: HashMap<(Option<usize>, &'static str), usize>,
+    entries: Vec<PathEntry>,
+}
+
+/// One scope path's totals since the start, and its time buckets within the window.
+struct PathEntry {
+    path: Vec<&'static str>,
+    stats: ScopeStats,
+    recent: VecDeque<TimeBucket>,
+}
+
+impl Paths {
+    /// The id of `name` under the path with id `parent`, adding the path if it is new.
+    fn id(&mut self, parent: Option<usize>, name: &'static str) -> usize {
+        if let Some(&id) = self.ids.get(&(parent, name)) {
+            return id;
+        }
+        let mut path = parent.map_or_else(Vec::new, |parent| self.entries[parent].path.clone());
+        path.push(name);
+        let id = self.entries.len();
+        self.entries.push(PathEntry {
+            path,
+            stats: ScopeStats::default(),
+            recent: VecDeque::new(),
+        });
+        self.ids.insert((parent, name), id);
+        id
+    }
+
+    /// Entries in path order: each parent before its children, and siblings by name.
+    fn sorted(&self) -> Vec<&PathEntry> {
+        let mut entries: Vec<&PathEntry> = self.entries.iter().collect();
+        entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        entries
+    }
 }
 
 /// A scope whose guard is still alive, and the time its finished children took so far.
 struct ActiveScope {
-    path: Vec<&'static str>,
+    id: usize,
     child_ticks: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct ScopeStats {
     hits: u64,
     ticks: u64,
@@ -104,7 +143,7 @@ struct TimeBucket {
 #[must_use = "bind this guard to a named variable to keep the scope running"]
 pub struct ProfileScope<'a> {
     profiler: &'a Profiler,
-    path: Vec<&'static str>,
+    id: usize,
     tsc_start: u64,
 }
 
@@ -116,7 +155,7 @@ impl Drop for ProfileScope<'_> {
             let mut active = self.profiler.active_scopes.borrow_mut();
             let position = active
                 .iter()
-                .rposition(|scope| scope.path == self.path)
+                .rposition(|scope| scope.id == self.id)
                 .unwrap();
             let was_innermost = position + 1 == active.len();
             // Remove this guard before checking the order so remaining guards can unwind.
@@ -132,7 +171,7 @@ impl Drop for ProfileScope<'_> {
         };
         let self_ticks = ticks.saturating_sub(finished.child_ticks);
         self.profiler
-            .record(finished.path, tsc_end, ticks, self_ticks);
+            .record(finished.id, tsc_end, ticks, self_ticks);
     }
 }
 
@@ -159,8 +198,7 @@ impl Profiler {
         Self {
             tsc_freq,
             window,
-            scopes: RefCell::new(BTreeMap::new()),
-            recent: RefCell::new(BTreeMap::new()),
+            paths: RefCell::new(Paths::default()),
             active_scopes: RefCell::new(Vec::new()),
         }
     }
@@ -170,11 +208,12 @@ impl Profiler {
         self.window
     }
 
-    fn record(&self, path: Vec<&'static str>, tsc_end: u64, ticks: u64, self_ticks: u64) {
+    fn record(&self, id: usize, tsc_end: u64, ticks: u64, self_ticks: u64) {
         let index = self.bucket_index(tsc_end);
         let oldest = self.oldest_bucket(index);
-        let mut recent = self.recent.borrow_mut();
-        let buckets = recent.entry(path.clone()).or_default();
+        let mut paths = self.paths.borrow_mut();
+        let entry = &mut paths.entries[id];
+        let buckets = &mut entry.recent;
         match buckets.back_mut() {
             Some(last) if last.index == index => {
                 last.hits += 1;
@@ -191,8 +230,7 @@ impl Profiler {
         while buckets.front().is_some_and(|bucket| bucket.index < oldest) {
             buckets.pop_front();
         }
-        let mut scopes = self.scopes.borrow_mut();
-        let stats = scopes.entry(path).or_default();
+        let stats = &mut entry.stats;
         stats.hits += 1;
         stats.ticks += ticks;
         stats.self_ticks += self_ticks;
@@ -227,22 +265,16 @@ impl Profiler {
     /// profiler.report();
     /// ```
     pub fn scope(&self, name: &'static str) -> ProfileScope<'_> {
-        let path = {
+        let id = {
             let mut active = self.active_scopes.borrow_mut();
-            let mut path = active
-                .last()
-                .map(|parent| parent.path.clone())
-                .unwrap_or_default();
-            path.push(name);
-            active.push(ActiveScope {
-                path: path.clone(),
-                child_ticks: 0,
-            });
-            path
+            let parent = active.last().map(|parent| parent.id);
+            let id = self.paths.borrow_mut().id(parent, name);
+            active.push(ActiveScope { id, child_ticks: 0 });
+            id
         };
         ProfileScope {
             profiler: self,
-            path,
+            id,
             tsc_start: rdtsc(),
         }
     }
@@ -257,8 +289,11 @@ impl Profiler {
 
     fn format_report(&self) -> String {
         let mut report = String::from("Scope timings (totals include children):\n");
-        let scopes = self.scopes.borrow();
-        for (path, stats) in scopes.iter() {
+        let paths = self.paths.borrow();
+        for PathEntry { path, stats, .. } in paths.sorted() {
+            if stats.hits == 0 {
+                continue;
+            }
             let indent = "  ".repeat(path.len() - 1);
             let name = path.last().unwrap();
             let milliseconds = stats.ticks as f64 / self.tsc_freq * 1000.0;
@@ -274,12 +309,11 @@ impl Profiler {
     /// Siblings are sorted by name, and each total includes child time.
     /// A parent that is still active appears with zero hits so its children have a place.
     pub fn snapshot(&self) -> Vec<ScopeReport> {
-        let scopes = self.scopes.borrow();
-        self.tree(
-            scopes
-                .iter()
-                .map(|(path, stats)| (path, stats.hits, stats.ticks, stats.self_ticks)),
-        )
+        let paths = self.paths.borrow();
+        self.tree(paths.sorted().into_iter().filter_map(|entry| {
+            let stats = entry.stats;
+            (stats.hits > 0).then_some((&entry.path, stats.hits, stats.ticks, stats.self_ticks))
+        }))
     }
 
     /// Like [`Profiler::snapshot`], but counting only scopes that ended in the last
@@ -290,9 +324,9 @@ impl Profiler {
 
     fn snapshot_at(&self, tsc_now: u64) -> Vec<ScopeReport> {
         let oldest = self.oldest_bucket(self.bucket_index(tsc_now));
-        let recent = self.recent.borrow();
-        self.tree(recent.iter().filter_map(|(path, buckets)| {
-            let in_window = buckets.iter().filter(|bucket| bucket.index >= oldest);
+        let paths = self.paths.borrow();
+        self.tree(paths.sorted().into_iter().filter_map(|entry| {
+            let in_window = entry.recent.iter().filter(|bucket| bucket.index >= oldest);
             let (hits, ticks, self_ticks) =
                 in_window.fold((0, 0, 0), |(hits, ticks, self_ticks), bucket| {
                     (
@@ -301,7 +335,7 @@ impl Profiler {
                         self_ticks + bucket.self_ticks,
                     )
                 });
-            (hits > 0).then_some((path, hits, ticks, self_ticks))
+            (hits > 0).then_some((&entry.path, hits, ticks, self_ticks))
         }))
     }
 
@@ -314,12 +348,13 @@ impl Profiler {
     fn series_at(&self, tsc_now: u64) -> TimeSeries {
         let newest = self.bucket_index(tsc_now);
         let length = self.window_buckets();
-        let recent = self.recent.borrow();
-        let scopes = recent
-            .iter()
-            .filter_map(|(path, buckets)| {
+        let paths = self.paths.borrow();
+        let scopes = paths
+            .sorted()
+            .into_iter()
+            .filter_map(|entry| {
                 let mut self_ticks = vec![0; length];
-                for bucket in buckets.iter().filter(|bucket| bucket.index <= newest) {
+                for bucket in entry.recent.iter().filter(|bucket| bucket.index <= newest) {
                     let age = (newest - bucket.index) as usize;
                     if age < length {
                         self_ticks[length - 1 - age] += bucket.self_ticks;
@@ -329,7 +364,7 @@ impl Profiler {
                     .iter()
                     .any(|&ticks| ticks > 0)
                     .then(|| ScopeSeries {
-                        path: path.clone(),
+                        path: entry.path.clone(),
                         self_times: self_ticks
                             .iter()
                             .map(|&ticks| self.duration(ticks))
@@ -452,16 +487,65 @@ impl ScopeReport {
 mod tests {
     use super::*;
 
+    impl Profiler {
+        /// The id of `path`, adding it and any missing parents.
+        fn id_of(&self, path: &[&'static str]) -> usize {
+            let mut paths = self.paths.borrow_mut();
+            let mut id = None;
+            for &name in path {
+                id = Some(paths.id(id, name));
+            }
+            id.unwrap()
+        }
+
+        /// Record one scope of `path` ending at `tsc_end`, as its guard would.
+        pub(crate) fn record_path(
+            &self,
+            path: &[&'static str],
+            tsc_end: u64,
+            ticks: u64,
+            self_ticks: u64,
+        ) {
+            self.record(self.id_of(path), tsc_end, ticks, self_ticks);
+        }
+
+        /// Replace the totals of `path`.
+        fn set_stats(&self, path: &[&'static str], hits: u64, ticks: u64, self_ticks: u64) {
+            let id = self.id_of(path);
+            self.paths.borrow_mut().entries[id].stats = ScopeStats {
+                hits,
+                ticks,
+                self_ticks,
+            };
+        }
+
+        /// The totals of `path`, or `None` until a scope of it has ended.
+        fn stats(&self, path: &[&'static str]) -> Option<ScopeStats> {
+            let paths = self.paths.borrow();
+            let entry = paths.entries.iter().find(|entry| entry.path == path)?;
+            (entry.stats.hits > 0).then_some(entry.stats)
+        }
+
+        /// How many paths have had a scope end.
+        fn recorded(&self) -> usize {
+            let paths = self.paths.borrow();
+            paths
+                .entries
+                .iter()
+                .filter(|entry| entry.stats.hits > 0)
+                .count()
+        }
+    }
+
     #[test]
     fn records_only_when_scope_ends() {
         let profiler = Profiler::new();
         let scope = profiler.scope("work");
 
-        assert!(profiler.scopes.borrow().is_empty());
+        assert_eq!(profiler.recorded(), 0);
         drop(scope);
 
-        let scopes = profiler.scopes.borrow();
-        assert_eq!(scopes[["work"].as_slice()].hits, 1);
+        assert_eq!(profiler.stats(&["work"]).unwrap().hits, 1);
     }
 
     #[test]
@@ -469,14 +553,12 @@ mod tests {
         let profiler = Profiler::new();
         profile_scope!(profiler, "outer", {
             profile_scope!(profiler, "inner", {});
-            let scopes = profiler.scopes.borrow();
-            assert_eq!(scopes[["outer", "inner"].as_slice()].hits, 1);
-            assert!(!scopes.contains_key(["outer"].as_slice()));
+            assert_eq!(profiler.stats(&["outer", "inner"]).unwrap().hits, 1);
+            assert!(profiler.stats(&["outer"]).is_none());
         });
 
-        let scopes = profiler.scopes.borrow();
-        let outer = &scopes[["outer"].as_slice()];
-        let inner = &scopes[["outer", "inner"].as_slice()];
+        let outer = profiler.stats(&["outer"]).unwrap();
+        let inner = profiler.stats(&["outer", "inner"]).unwrap();
         assert_eq!(outer.hits, 1);
         assert_eq!(inner.hits, 1);
         assert!(outer.ticks >= inner.ticks);
@@ -489,17 +571,16 @@ mod tests {
             let _first = profiler.scope("work");
             let _nested = profiler.scope("work");
         }
-        let first_ticks = profiler.scopes.borrow()[["work"].as_slice()].ticks;
+        let first_ticks = profiler.stats(&["work"]).unwrap().ticks;
 
         {
             let _third = profiler.scope("work");
         }
 
-        let scopes = profiler.scopes.borrow();
-        assert_eq!(scopes.len(), 2);
-        assert_eq!(scopes[["work"].as_slice()].hits, 2);
-        assert_eq!(scopes[["work", "work"].as_slice()].hits, 1);
-        assert!(scopes[["work"].as_slice()].ticks >= first_ticks);
+        assert_eq!(profiler.recorded(), 2);
+        assert_eq!(profiler.stats(&["work"]).unwrap().hits, 2);
+        assert_eq!(profiler.stats(&["work", "work"]).unwrap().hits, 1);
+        assert!(profiler.stats(&["work"]).unwrap().ticks >= first_ticks);
     }
 
     #[test]
@@ -510,14 +591,13 @@ mod tests {
             profile_scope!(profiler, "first");
             profile_scope!(&profiler, "second",);
 
-            assert!(profiler.scopes.borrow().is_empty());
+            assert_eq!(profiler.recorded(), 0);
             assert_eq!(_profile_scope, "caller variable");
         }
 
-        let scopes = profiler.scopes.borrow();
-        assert_eq!(scopes.len(), 2);
-        assert_eq!(scopes[["first"].as_slice()].hits, 1);
-        assert_eq!(scopes[["first", "second"].as_slice()].hits, 1);
+        assert_eq!(profiler.recorded(), 2);
+        assert_eq!(profiler.stats(&["first"]).unwrap().hits, 1);
+        assert_eq!(profiler.stats(&["first", "second"]).unwrap().hits, 1);
     }
 
     #[test]
@@ -525,14 +605,14 @@ mod tests {
         let profiler = Profiler::new();
         let mut calls = 0;
         let value = profile_scope!(&profiler, "work", {
-            assert!(profiler.scopes.borrow().is_empty());
+            assert_eq!(profiler.recorded(), 0);
             calls += 1;
             String::from("finished")
         },);
 
         assert_eq!(value, "finished");
         assert_eq!(calls, 1);
-        assert_eq!(profiler.scopes.borrow()[["work"].as_slice()].hits, 1);
+        assert_eq!(profiler.stats(&["work"]).unwrap().hits, 1);
     }
 
     #[test]
@@ -551,7 +631,7 @@ mod tests {
         assert_eq!(work(&profiler, Err(())), Err(()));
         assert_eq!(work(&profiler, Ok(0)), Ok(10));
         assert_eq!(work(&profiler, Ok(1)), Ok(20));
-        assert_eq!(profiler.scopes.borrow()[["work"].as_slice()].hits, 3);
+        assert_eq!(profiler.stats(&["work"]).unwrap().hits, 3);
     }
 
     #[test]
@@ -571,7 +651,7 @@ mod tests {
         }
 
         assert_eq!(completed, 1);
-        assert_eq!(profiler.scopes.borrow()[["iteration"].as_slice()].hits, 3);
+        assert_eq!(profiler.stats(&["iteration"]).unwrap().hits, 3);
     }
 
     #[test]
@@ -586,56 +666,20 @@ mod tests {
             profile_scope!(profiler, "work", {});
         });
 
-        let scopes = profiler.scopes.borrow();
-        assert_eq!(scopes.len(), 4);
-        assert_eq!(scopes[["first"].as_slice()].hits, 2);
-        assert_eq!(scopes[["first", "work"].as_slice()].hits, 2);
-        assert_eq!(scopes[["second"].as_slice()].hits, 1);
-        assert_eq!(scopes[["second", "work"].as_slice()].hits, 1);
+        assert_eq!(profiler.recorded(), 4);
+        assert_eq!(profiler.stats(&["first"]).unwrap().hits, 2);
+        assert_eq!(profiler.stats(&["first", "work"]).unwrap().hits, 2);
+        assert_eq!(profiler.stats(&["second"]).unwrap().hits, 1);
+        assert_eq!(profiler.stats(&["second", "work"]).unwrap().hits, 1);
     }
 
     #[test]
     fn report_indents_children_and_does_not_add_their_time_to_the_parent() {
-        let profiler = Profiler {
-            tsc_freq: 1000.0,
-            window: DEFAULT_WINDOW,
-            recent: RefCell::new(BTreeMap::new()),
-            scopes: RefCell::new(BTreeMap::from([
-                (
-                    vec!["frame", "update"],
-                    ScopeStats {
-                        hits: 2,
-                        ticks: 30,
-                        self_ticks: 20,
-                    },
-                ),
-                (
-                    vec!["frame"],
-                    ScopeStats {
-                        hits: 2,
-                        ticks: 100,
-                        self_ticks: 50,
-                    },
-                ),
-                (
-                    vec!["frame", "update", "physics"],
-                    ScopeStats {
-                        hits: 2,
-                        ticks: 10,
-                        self_ticks: 10,
-                    },
-                ),
-                (
-                    vec!["frame", "render"],
-                    ScopeStats {
-                        hits: 2,
-                        ticks: 20,
-                        self_ticks: 20,
-                    },
-                ),
-            ])),
-            active_scopes: RefCell::new(Vec::new()),
-        };
+        let profiler = millisecond_profiler();
+        profiler.set_stats(&["frame", "update"], 2, 30, 20);
+        profiler.set_stats(&["frame"], 2, 100, 50);
+        profiler.set_stats(&["frame", "update", "physics"], 2, 10, 10);
+        profiler.set_stats(&["frame", "render"], 2, 20, 20);
 
         assert_eq!(
             profiler.format_report(),
@@ -660,54 +704,12 @@ mod tests {
 
     #[test]
     fn snapshot_nests_children_sorted_by_name() {
-        let profiler = Profiler {
-            tsc_freq: 1000.0,
-            window: DEFAULT_WINDOW,
-            recent: RefCell::new(BTreeMap::new()),
-            scopes: RefCell::new(BTreeMap::from([
-                (
-                    vec!["frame", "update"],
-                    ScopeStats {
-                        hits: 2,
-                        ticks: 30,
-                        self_ticks: 20,
-                    },
-                ),
-                (
-                    vec!["frame"],
-                    ScopeStats {
-                        hits: 2,
-                        ticks: 100,
-                        self_ticks: 50,
-                    },
-                ),
-                (
-                    vec!["frame", "update", "physics"],
-                    ScopeStats {
-                        hits: 2,
-                        ticks: 10,
-                        self_ticks: 10,
-                    },
-                ),
-                (
-                    vec!["frame", "render"],
-                    ScopeStats {
-                        hits: 2,
-                        ticks: 20,
-                        self_ticks: 20,
-                    },
-                ),
-                (
-                    vec!["load"],
-                    ScopeStats {
-                        hits: 1,
-                        ticks: 5,
-                        self_ticks: 5,
-                    },
-                ),
-            ])),
-            active_scopes: RefCell::new(Vec::new()),
-        };
+        let profiler = millisecond_profiler();
+        profiler.set_stats(&["frame", "update"], 2, 30, 20);
+        profiler.set_stats(&["frame"], 2, 100, 50);
+        profiler.set_stats(&["frame", "update", "physics"], 2, 10, 10);
+        profiler.set_stats(&["frame", "render"], 2, 20, 20);
+        profiler.set_stats(&["load"], 1, 5, 5);
 
         assert_eq!(
             profiler.snapshot(),
@@ -765,9 +767,9 @@ mod tests {
     #[test]
     fn recent_snapshot_averages_only_hits_within_the_window() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["frame"], 1_000, 90, 90);
-        profiler.record(vec!["frame"], 11_000, 4, 4);
-        profiler.record(vec!["frame"], 12_000, 6, 6);
+        profiler.record_path(&["frame"], 1_000, 90, 90);
+        profiler.record_path(&["frame"], 11_000, 4, 4);
+        profiler.record_path(&["frame"], 12_000, 6, 6);
 
         let recent = profiler.snapshot_at(12_000);
 
@@ -779,8 +781,7 @@ mod tests {
         Profiler {
             tsc_freq: 1000.0,
             window: Duration::from_secs(10),
-            scopes: RefCell::new(BTreeMap::new()),
-            recent: RefCell::new(BTreeMap::new()),
+            paths: RefCell::new(Paths::default()),
             active_scopes: RefCell::new(Vec::new()),
         }
     }
@@ -788,8 +789,8 @@ mod tests {
     #[test]
     fn recent_snapshot_counts_only_scopes_that_ended_within_the_window() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["frame"], 1_000, 5, 5);
-        profiler.record(vec!["frame"], 12_000, 7, 7);
+        profiler.record_path(&["frame"], 1_000, 5, 5);
+        profiler.record_path(&["frame"], 12_000, 7, 7);
 
         assert_eq!(
             profiler.snapshot_at(12_000),
@@ -801,9 +802,9 @@ mod tests {
     #[test]
     fn recent_snapshot_sums_every_hit_within_the_window() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["frame"], 3_000, 4, 4);
-        profiler.record(vec!["frame"], 3_050, 6, 6);
-        profiler.record(vec!["frame"], 9_000, 10, 10);
+        profiler.record_path(&["frame"], 3_000, 4, 4);
+        profiler.record_path(&["frame"], 3_050, 6, 6);
+        profiler.record_path(&["frame"], 9_000, 10, 10);
 
         assert_eq!(
             profiler.snapshot_at(10_000),
@@ -815,8 +816,8 @@ mod tests {
     fn recent_snapshot_self_time_excludes_a_child_that_ended_before_the_window() {
         let profiler = millisecond_profiler();
         // At 12.0 s the window starts at 2.1 s: the child ends just before, its parent after.
-        profiler.record(vec!["frame", "render"], 2_090, 10, 10);
-        profiler.record(vec!["frame"], 2_110, 30, 20);
+        profiler.record_path(&["frame", "render"], 2_090, 10, 10);
+        profiler.record_path(&["frame"], 2_110, 30, 20);
 
         let recent = profiler.snapshot_at(12_000);
 
@@ -826,9 +827,9 @@ mod tests {
     #[test]
     fn recent_snapshot_omits_scopes_with_no_hits_in_the_window() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["frame", "update"], 1_000, 2, 2);
-        profiler.record(vec!["frame"], 1_000, 5, 5);
-        profiler.record(vec!["load"], 12_000, 3, 3);
+        profiler.record_path(&["frame", "update"], 1_000, 2, 2);
+        profiler.record_path(&["frame"], 1_000, 5, 5);
+        profiler.record_path(&["load"], 12_000, 3, 3);
 
         assert_eq!(
             profiler.snapshot_at(12_000),
@@ -840,10 +841,11 @@ mod tests {
     fn time_buckets_older_than_the_window_are_dropped() {
         let profiler = millisecond_profiler();
         for millisecond in (0..60_000).step_by(10) {
-            profiler.record(vec!["frame"], millisecond, 1, 1);
+            profiler.record_path(&["frame"], millisecond, 1, 1);
         }
 
-        let buckets = profiler.recent.borrow()[&vec!["frame"]].len();
+        let id = profiler.id_of(&["frame"]);
+        let buckets = profiler.paths.borrow().entries[id].recent.len();
         assert!(buckets <= 100, "{buckets} buckets kept for a 10 s window");
     }
 
@@ -859,9 +861,9 @@ mod tests {
     #[test]
     fn recent_series_puts_self_time_in_the_bucket_each_scope_ended_in() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["load"], 5_050, 7, 7);
-        profiler.record(vec!["frame", "render"], 9_940, 10, 10);
-        profiler.record(vec!["frame"], 9_950, 30, 20);
+        profiler.record_path(&["load"], 5_050, 7, 7);
+        profiler.record_path(&["frame", "render"], 9_940, 10, 10);
+        profiler.record_path(&["frame"], 9_950, 30, 20);
 
         // At 10.0 s the window holds buckets 0.1 s to 10.0 s, so 9.95 s is position 98.
         assert_eq!(
@@ -880,9 +882,9 @@ mod tests {
     #[test]
     fn recent_series_leaves_out_scopes_with_no_self_time_in_the_window() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["old"], 1_000, 5, 5);
-        profiler.record(vec!["frame", "update"], 11_950, 10, 10);
-        profiler.record(vec!["frame"], 11_950, 10, 0);
+        profiler.record_path(&["old"], 1_000, 5, 5);
+        profiler.record_path(&["frame", "update"], 11_950, 10, 10);
+        profiler.record_path(&["frame"], 11_950, 10, 0);
 
         let recent = profiler.series_at(12_000);
 
@@ -948,9 +950,8 @@ mod tests {
 
         assert!(result.is_err());
         assert!(profiler.active_scopes.borrow().is_empty());
-        let scopes = profiler.scopes.borrow();
-        assert_eq!(scopes[["outer"].as_slice()].hits, 1);
-        assert_eq!(scopes[["outer", "inner"].as_slice()].hits, 1);
+        assert_eq!(profiler.stats(&["outer"]).unwrap().hits, 1);
+        assert_eq!(profiler.stats(&["outer", "inner"]).unwrap().hits, 1);
     }
 
     #[test]
@@ -965,6 +966,6 @@ mod tests {
         assert!(result.is_err());
         assert!(profiler.active_scopes.borrow().is_empty());
         profile_scope!(profiler, "after", {});
-        assert_eq!(profiler.scopes.borrow()[["after"].as_slice()].hits, 1);
+        assert_eq!(profiler.stats(&["after"]).unwrap().hits, 1);
     }
 }
