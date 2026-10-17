@@ -74,7 +74,13 @@ pub struct Profiler {
     window: Duration,
     scopes: RefCell<BTreeMap<Vec<&'static str>, ScopeStats>>,
     recent: RefCell<BTreeMap<Vec<&'static str>, VecDeque<TimeBucket>>>,
-    active_scopes: RefCell<Vec<Vec<&'static str>>>,
+    active_scopes: RefCell<Vec<ActiveScope>>,
+}
+
+/// A scope whose guard is still alive, and the time its finished children took so far.
+struct ActiveScope {
+    path: Vec<&'static str>,
+    child_ticks: u64,
 }
 
 #[derive(Default)]
@@ -83,11 +89,12 @@ struct ScopeStats {
     ticks: u64,
 }
 
-/// The hits and ticks of scopes that ended within one [`BUCKET`] of time.
+/// The hits, ticks and self ticks of scopes that ended within one [`BUCKET`] of time.
 struct TimeBucket {
     index: u64,
     hits: u64,
     ticks: u64,
+    self_ticks: u64,
 }
 
 /// Records a scope when dropped. Nested scopes contribute to their parents' time.
@@ -103,20 +110,28 @@ pub struct ProfileScope<'a> {
 impl Drop for ProfileScope<'_> {
     fn drop(&mut self) {
         let tsc_end = rdtsc();
-        let path = {
+        let ticks = tsc_end - self.tsc_start;
+        let finished = {
             let mut active = self.profiler.active_scopes.borrow_mut();
-            let position = active.iter().rposition(|path| path == &self.path).unwrap();
+            let position = active
+                .iter()
+                .rposition(|scope| scope.path == self.path)
+                .unwrap();
             let was_innermost = position + 1 == active.len();
             // Remove this guard before checking the order so remaining guards can unwind.
-            let path = active.remove(position);
+            let finished = active.remove(position);
             assert!(
                 was_innermost,
                 "profiling scopes must end in reverse creation order"
             );
-            path
+            if let Some(parent) = active.last_mut() {
+                parent.child_ticks += ticks;
+            }
+            finished
         };
+        let self_ticks = ticks.saturating_sub(finished.child_ticks);
         self.profiler
-            .record(path, tsc_end, tsc_end - self.tsc_start);
+            .record(finished.path, tsc_end, ticks, self_ticks);
     }
 }
 
@@ -154,7 +169,7 @@ impl Profiler {
         self.window
     }
 
-    fn record(&self, path: Vec<&'static str>, tsc_end: u64, ticks: u64) {
+    fn record(&self, path: Vec<&'static str>, tsc_end: u64, ticks: u64, self_ticks: u64) {
         let index = self.bucket_index(tsc_end);
         let oldest = self.oldest_bucket(index);
         let mut recent = self.recent.borrow_mut();
@@ -163,11 +178,13 @@ impl Profiler {
             Some(last) if last.index == index => {
                 last.hits += 1;
                 last.ticks += ticks;
+                last.self_ticks += self_ticks;
             }
             _ => buckets.push_back(TimeBucket {
                 index,
                 hits: 1,
                 ticks,
+                self_ticks,
             }),
         }
         while buckets.front().is_some_and(|bucket| bucket.index < oldest) {
@@ -210,9 +227,15 @@ impl Profiler {
     pub fn scope(&self, name: &'static str) -> ProfileScope<'_> {
         let path = {
             let mut active = self.active_scopes.borrow_mut();
-            let mut path = active.last().cloned().unwrap_or_default();
+            let mut path = active
+                .last()
+                .map(|parent| parent.path.clone())
+                .unwrap_or_default();
             path.push(name);
-            active.push(path.clone());
+            active.push(ActiveScope {
+                path: path.clone(),
+                child_ticks: 0,
+            });
             path
         };
         ProfileScope {
@@ -285,46 +308,21 @@ impl Profiler {
         let newest = self.bucket_index(tsc_now);
         let length = self.window_buckets();
         let recent = self.recent.borrow();
-        let totals: BTreeMap<&[&'static str], Vec<u64>> = recent
+        let scopes = recent
             .iter()
-            .map(|(path, buckets)| {
-                let mut ticks = vec![0; length];
+            .filter_map(|(path, buckets)| {
+                let mut self_ticks = vec![0; length];
                 for bucket in buckets.iter().filter(|bucket| bucket.index <= newest) {
                     let age = (newest - bucket.index) as usize;
                     if age < length {
-                        ticks[length - 1 - age] += bucket.ticks;
+                        self_ticks[length - 1 - age] += bucket.self_ticks;
                     }
                 }
-                (path.as_slice(), ticks)
-            })
-            .collect();
-
-        let mut children_ticks: BTreeMap<&[&'static str], Vec<u64>> = BTreeMap::new();
-        for (path, ticks) in &totals {
-            let parent = &path[..path.len() - 1];
-            if !parent.is_empty() {
-                let sums = children_ticks
-                    .entry(parent)
-                    .or_insert_with(|| vec![0; length]);
-                sums.iter_mut()
-                    .zip(ticks)
-                    .for_each(|(sum, ticks)| *sum += ticks);
-            }
-        }
-
-        let scopes = totals
-            .iter()
-            .filter_map(|(path, ticks)| {
-                let children = children_ticks.get(path);
-                let self_ticks = ticks.iter().enumerate().map(|(position, &ticks)| {
-                    ticks.saturating_sub(children.map_or(0, |children| children[position]))
-                });
-                let self_ticks: Vec<u64> = self_ticks.collect();
                 self_ticks
                     .iter()
                     .any(|&ticks| ticks > 0)
                     .then(|| ScopeSeries {
-                        path: path.to_vec(),
+                        path: path.clone(),
                         self_times: self_ticks
                             .iter()
                             .map(|&ticks| self.duration(ticks))
@@ -699,9 +697,9 @@ mod tests {
     #[test]
     fn recent_snapshot_averages_only_hits_within_the_window() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["frame"], 1_000, 90);
-        profiler.record(vec!["frame"], 11_000, 4);
-        profiler.record(vec!["frame"], 12_000, 6);
+        profiler.record(vec!["frame"], 1_000, 90, 90);
+        profiler.record(vec!["frame"], 11_000, 4, 4);
+        profiler.record(vec!["frame"], 12_000, 6, 6);
 
         let recent = profiler.snapshot_at(12_000);
 
@@ -722,8 +720,8 @@ mod tests {
     #[test]
     fn recent_snapshot_counts_only_scopes_that_ended_within_the_window() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["frame"], 1_000, 5);
-        profiler.record(vec!["frame"], 12_000, 7);
+        profiler.record(vec!["frame"], 1_000, 5, 5);
+        profiler.record(vec!["frame"], 12_000, 7, 7);
 
         assert_eq!(
             profiler.snapshot_at(12_000),
@@ -735,9 +733,9 @@ mod tests {
     #[test]
     fn recent_snapshot_sums_every_hit_within_the_window() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["frame"], 3_000, 4);
-        profiler.record(vec!["frame"], 3_050, 6);
-        profiler.record(vec!["frame"], 9_000, 10);
+        profiler.record(vec!["frame"], 3_000, 4, 4);
+        profiler.record(vec!["frame"], 3_050, 6, 6);
+        profiler.record(vec!["frame"], 9_000, 10, 10);
 
         assert_eq!(
             profiler.snapshot_at(10_000),
@@ -748,9 +746,9 @@ mod tests {
     #[test]
     fn recent_snapshot_omits_scopes_with_no_hits_in_the_window() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["frame", "update"], 1_000, 2);
-        profiler.record(vec!["frame"], 1_000, 5);
-        profiler.record(vec!["load"], 12_000, 3);
+        profiler.record(vec!["frame", "update"], 1_000, 2, 2);
+        profiler.record(vec!["frame"], 1_000, 5, 5);
+        profiler.record(vec!["load"], 12_000, 3, 3);
 
         assert_eq!(
             profiler.snapshot_at(12_000),
@@ -762,7 +760,7 @@ mod tests {
     fn time_buckets_older_than_the_window_are_dropped() {
         let profiler = millisecond_profiler();
         for millisecond in (0..60_000).step_by(10) {
-            profiler.record(vec!["frame"], millisecond, 1);
+            profiler.record(vec!["frame"], millisecond, 1, 1);
         }
 
         let buckets = profiler.recent.borrow()[&vec!["frame"]].len();
@@ -781,9 +779,9 @@ mod tests {
     #[test]
     fn recent_series_puts_self_time_in_the_bucket_each_scope_ended_in() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["load"], 5_050, 7);
-        profiler.record(vec!["frame", "render"], 9_940, 10);
-        profiler.record(vec!["frame"], 9_950, 30);
+        profiler.record(vec!["load"], 5_050, 7, 7);
+        profiler.record(vec!["frame", "render"], 9_940, 10, 10);
+        profiler.record(vec!["frame"], 9_950, 30, 20);
 
         // At 10.0 s the window holds buckets 0.1 s to 10.0 s, so 9.95 s is position 98.
         assert_eq!(
@@ -802,15 +800,41 @@ mod tests {
     #[test]
     fn recent_series_leaves_out_scopes_with_no_self_time_in_the_window() {
         let profiler = millisecond_profiler();
-        profiler.record(vec!["old"], 1_000, 5);
-        profiler.record(vec!["frame", "update"], 11_950, 10);
-        profiler.record(vec!["frame"], 11_950, 10);
+        profiler.record(vec!["old"], 1_000, 5, 5);
+        profiler.record(vec!["frame", "update"], 11_950, 10, 10);
+        profiler.record(vec!["frame"], 11_950, 10, 0);
 
         let recent = profiler.series_at(12_000);
 
         assert_eq!(
             recent.scopes,
             vec![series(vec!["frame", "update"], &[(98, 10)])]
+        );
+    }
+
+    #[test]
+    fn recent_series_self_time_matches_the_tree_when_a_child_ends_in_an_earlier_bucket() {
+        // One tick per bucket, so the child and its parent always end in different buckets.
+        let profiler = Profiler {
+            tsc_freq: 10.0,
+            window: Duration::from_secs(100_000),
+            ..millisecond_profiler()
+        };
+        profile_scope!(profiler, "frame", {
+            profile_scope!(profiler, "render", {});
+        });
+
+        let tsc_now = rdtsc();
+        let tree_self = profiler.snapshot_at(tsc_now)[0].self_time();
+        let series = profiler.series_at(tsc_now);
+        let frame = series.scopes.iter().find(|scope| scope.path == ["frame"]);
+        let series_self: Duration =
+            frame.map_or(Duration::ZERO, |frame| frame.self_times.iter().sum());
+
+        let difference = series_self.abs_diff(tree_self);
+        assert!(
+            difference < Duration::from_millis(1),
+            "series {series_self:?}, tree {tree_self:?}"
         );
     }
 
