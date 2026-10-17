@@ -9,6 +9,7 @@ egui = { version = "0.37.0", default-features = false, features = ["default_font
 
 [features]
 egui = ["dep:egui"]
+server = []
 
 [dev-dependencies]
 eframe = "0.37"
@@ -16,3 +17,12 @@ eframe = "0.37"
 [[example]]
 name = "egui_tree"
 required-features = ["egui"]
+
+[[example]]
+name = "serve"
+required-features = ["server"]
+
+# Release speed with debug info, so perf can attribute inlined profiler code.
+[profile.profiling]
+inherits = "release"
+debug = true

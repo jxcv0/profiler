@@ -8,6 +8,11 @@ mod egui_ui;
 #[cfg(feature = "egui")]
 pub use egui_ui::{scope_color, show_scopes, show_timeline};
 
+#[cfg(feature = "server")]
+mod server;
+#[cfg(feature = "server")]
+pub use server::ProfileServer;
+
 /// Profile a supplied block and return its value.
 /// The profiler is borrowed, and repeated names under the same parent share results.
 /// The block keeps normal `return`, `?`, `break`, and `continue` behavior.
@@ -704,7 +709,7 @@ mod tests {
     }
 
     /// A profiler whose clock ticks once per millisecond, for recording at chosen times.
-    fn millisecond_profiler() -> Profiler {
+    pub(crate) fn millisecond_profiler() -> Profiler {
         Profiler {
             tsc_freq: 1000.0,
             window: Duration::from_secs(10),

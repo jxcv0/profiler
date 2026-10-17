@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "profiler": {
+      "command": "uv",
+      "args": ["run", "--script", "mcp_server/profiler_mcp.py"]
+    }
+  }
+}
