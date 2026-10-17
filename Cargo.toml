@@ -22,6 +22,10 @@ required-features = ["egui"]
 name = "serve"
 required-features = ["server"]
 
+[[example]]
+name = "self_profile"
+required-features = ["server"]
+
 # Release speed with debug info, so perf can attribute inlined profiler code.
 [profile.profiling]
 inherits = "release"
