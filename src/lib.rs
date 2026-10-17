@@ -87,6 +87,7 @@ struct ActiveScope {
 struct ScopeStats {
     hits: u64,
     ticks: u64,
+    self_ticks: u64,
 }
 
 /// The hits, ticks and self ticks of scopes that ended within one [`BUCKET`] of time.
@@ -194,6 +195,7 @@ impl Profiler {
         let stats = scopes.entry(path).or_default();
         stats.hits += 1;
         stats.ticks += ticks;
+        stats.self_ticks += self_ticks;
     }
 
     fn bucket_index(&self, tsc: u64) -> u64 {
@@ -276,7 +278,7 @@ impl Profiler {
         self.tree(
             scopes
                 .iter()
-                .map(|(path, stats)| (path, stats.hits, stats.ticks)),
+                .map(|(path, stats)| (path, stats.hits, stats.ticks, stats.self_ticks)),
         )
     }
 
@@ -291,10 +293,15 @@ impl Profiler {
         let recent = self.recent.borrow();
         self.tree(recent.iter().filter_map(|(path, buckets)| {
             let in_window = buckets.iter().filter(|bucket| bucket.index >= oldest);
-            let (hits, ticks) = in_window.fold((0, 0), |(hits, ticks), bucket| {
-                (hits + bucket.hits, ticks + bucket.ticks)
-            });
-            (hits > 0).then_some((path, hits, ticks))
+            let (hits, ticks, self_ticks) =
+                in_window.fold((0, 0, 0), |(hits, ticks, self_ticks), bucket| {
+                    (
+                        hits + bucket.hits,
+                        ticks + bucket.ticks,
+                        self_ticks + bucket.self_ticks,
+                    )
+                });
+            (hits > 0).then_some((path, hits, ticks, self_ticks))
         }))
     }
 
@@ -340,14 +347,14 @@ impl Profiler {
         Duration::from_secs_f64(ticks as f64 / self.tsc_freq)
     }
 
-    /// Nest `(path, hits, ticks)` entries, given in path order, into a tree of reports.
+    /// Nest `(path, hits, ticks, self_ticks)` entries, given in path order, into a tree.
     fn tree<'a>(
         &self,
-        entries: impl Iterator<Item = (&'a Vec<&'static str>, u64, u64)>,
+        entries: impl Iterator<Item = (&'a Vec<&'static str>, u64, u64, u64)>,
     ) -> Vec<ScopeReport> {
         let mut roots = Vec::new();
         // Sorted paths visit each parent before its children, and siblings in name order.
-        for (path, hits, ticks) in entries {
+        for (path, hits, ticks, self_ticks) in entries {
             let (name, parents) = path.split_last().unwrap();
             let mut siblings = &mut roots;
             for &parent in parents {
@@ -356,7 +363,8 @@ impl Profiler {
             siblings.push(ScopeReport {
                 name,
                 hits,
-                total: Duration::from_secs_f64(ticks as f64 / self.tsc_freq),
+                total: self.duration(ticks),
+                self_total: self.duration(self_ticks),
                 children: Vec::new(),
             });
         }
@@ -387,14 +395,33 @@ pub struct ScopeReport {
     pub hits: u64,
     /// Total time across all hits, including children.
     pub total: Duration,
+    /// Time across all hits outside child scopes, measured as each hit ended.
+    self_total: Duration,
     pub children: Vec<ScopeReport>,
 }
 
 impl ScopeReport {
     /// Time spent in this scope itself, outside its child scopes.
     pub fn self_time(&self) -> Duration {
-        let children: Duration = self.children.iter().map(|child| child.total).sum();
-        self.total.saturating_sub(children)
+        self.self_total
+    }
+
+    /// A report whose self time is its total less its children's, for tests to build trees.
+    #[cfg(test)]
+    pub(crate) fn with_children(
+        name: &'static str,
+        hits: u64,
+        total: Duration,
+        children: Vec<ScopeReport>,
+    ) -> ScopeReport {
+        let children_total: Duration = children.iter().map(|child| child.total).sum();
+        ScopeReport {
+            name,
+            hits,
+            total,
+            self_total: total.saturating_sub(children_total),
+            children,
+        }
     }
 
     /// Mean time per hit, including children, or `None` for a scope with no hits.
@@ -413,6 +440,7 @@ impl ScopeReport {
                 name,
                 hits: 0,
                 total: Duration::ZERO,
+                self_total: Duration::ZERO,
                 children: Vec::new(),
             });
         }
@@ -573,19 +601,38 @@ mod tests {
             window: DEFAULT_WINDOW,
             recent: RefCell::new(BTreeMap::new()),
             scopes: RefCell::new(BTreeMap::from([
-                (vec!["frame", "update"], ScopeStats { hits: 2, ticks: 30 }),
+                (
+                    vec!["frame", "update"],
+                    ScopeStats {
+                        hits: 2,
+                        ticks: 30,
+                        self_ticks: 20,
+                    },
+                ),
                 (
                     vec!["frame"],
                     ScopeStats {
                         hits: 2,
                         ticks: 100,
+                        self_ticks: 50,
                     },
                 ),
                 (
                     vec!["frame", "update", "physics"],
-                    ScopeStats { hits: 2, ticks: 10 },
+                    ScopeStats {
+                        hits: 2,
+                        ticks: 10,
+                        self_ticks: 10,
+                    },
                 ),
-                (vec!["frame", "render"], ScopeStats { hits: 2, ticks: 20 }),
+                (
+                    vec!["frame", "render"],
+                    ScopeStats {
+                        hits: 2,
+                        ticks: 20,
+                        self_ticks: 20,
+                    },
+                ),
             ])),
             active_scopes: RefCell::new(Vec::new()),
         };
@@ -608,12 +655,7 @@ mod tests {
         milliseconds: u64,
         children: Vec<ScopeReport>,
     ) -> ScopeReport {
-        ScopeReport {
-            name,
-            hits,
-            total: Duration::from_millis(milliseconds),
-            children,
-        }
+        ScopeReport::with_children(name, hits, Duration::from_millis(milliseconds), children)
     }
 
     #[test]
@@ -623,20 +665,46 @@ mod tests {
             window: DEFAULT_WINDOW,
             recent: RefCell::new(BTreeMap::new()),
             scopes: RefCell::new(BTreeMap::from([
-                (vec!["frame", "update"], ScopeStats { hits: 2, ticks: 30 }),
+                (
+                    vec!["frame", "update"],
+                    ScopeStats {
+                        hits: 2,
+                        ticks: 30,
+                        self_ticks: 20,
+                    },
+                ),
                 (
                     vec!["frame"],
                     ScopeStats {
                         hits: 2,
                         ticks: 100,
+                        self_ticks: 50,
                     },
                 ),
                 (
                     vec!["frame", "update", "physics"],
-                    ScopeStats { hits: 2, ticks: 10 },
+                    ScopeStats {
+                        hits: 2,
+                        ticks: 10,
+                        self_ticks: 10,
+                    },
                 ),
-                (vec!["frame", "render"], ScopeStats { hits: 2, ticks: 20 }),
-                (vec!["load"], ScopeStats { hits: 1, ticks: 5 }),
+                (
+                    vec!["frame", "render"],
+                    ScopeStats {
+                        hits: 2,
+                        ticks: 20,
+                        self_ticks: 20,
+                    },
+                ),
+                (
+                    vec!["load"],
+                    ScopeStats {
+                        hits: 1,
+                        ticks: 5,
+                        self_ticks: 5,
+                    },
+                ),
             ])),
             active_scopes: RefCell::new(Vec::new()),
         };
@@ -741,6 +809,18 @@ mod tests {
             profiler.snapshot_at(10_000),
             vec![report("frame", 3, 20, vec![])]
         );
+    }
+
+    #[test]
+    fn recent_snapshot_self_time_excludes_a_child_that_ended_before_the_window() {
+        let profiler = millisecond_profiler();
+        // At 12.0 s the window starts at 2.1 s: the child ends just before, its parent after.
+        profiler.record(vec!["frame", "render"], 2_090, 10, 10);
+        profiler.record(vec!["frame"], 2_110, 30, 20);
+
+        let recent = profiler.snapshot_at(12_000);
+
+        assert_eq!(recent[0].self_time(), Duration::from_millis(20));
     }
 
     #[test]

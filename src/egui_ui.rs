@@ -242,12 +242,7 @@ mod tests {
         milliseconds: u64,
         children: Vec<ScopeReport>,
     ) -> ScopeReport {
-        ScopeReport {
-            name,
-            hits,
-            total: Duration::from_millis(milliseconds),
-            children,
-        }
+        ScopeReport::with_children(name, hits, Duration::from_millis(milliseconds), children)
     }
 
     #[test]
